@@ -314,12 +314,23 @@ class _QueueServiceBase(abc.ABC, Generic[T]):
         Returns an awaitable if called from an async context.
         """
         futures: list[concurrent.futures.Future[bool]] = []
-        with cls._instance_lock:
-            with cls._instance_cache_lock:
-                instances = tuple(cls._instances.values())
+        # The timeout also bounds the wait for `_instance_lock`. A thread that is
+        # creating a service holds it and may need `logging._lock`, which our caller
+        # can hold, e.g. `APILogHandler.flush` during `logging.shutdown`. Waiting
+        # forever for it would deadlock both threads, so give up instead.
+        if timeout is None:
+            acquired = cls._instance_lock.acquire()
+        else:
+            acquired = cls._instance_lock.acquire(timeout=max(timeout, 0))
+        if acquired:
+            try:
+                with cls._instance_cache_lock:
+                    instances = tuple(cls._instances.values())
 
-            for instance in instances:
-                futures.append(instance._drain(at_exit=at_exit))
+                for instance in instances:
+                    futures.append(instance._drain(at_exit=at_exit))
+            finally:
+                cls._instance_lock.release()
 
         if get_running_loop() is not None:
             if futures:

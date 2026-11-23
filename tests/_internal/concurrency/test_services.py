@@ -562,6 +562,58 @@ async def test_drain_all_timeout_async():
     assert t1 - t0 < 2
 
 
+class StartingService(MockService):
+    """A service that blocks in `__init__`, i.e. while `instance()` holds the lock."""
+
+    creating = threading.Event()
+    release = threading.Event()
+
+    def __init__(self) -> None:
+        self.creating.set()
+        self.release.wait()
+        super().__init__()
+
+
+@contextlib.contextmanager
+def starting_service_instance():
+    StartingService.creating.clear()
+    StartingService.release.clear()
+    # Unblock the creating thread after a while even if `drain_all` never returns,
+    # so a regression fails the test instead of hanging it
+    timer = threading.Timer(5, StartingService.release.set)
+    timer.start()
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(StartingService.instance)
+        try:
+            assert StartingService.creating.wait(5)
+            yield
+        finally:
+            StartingService.release.set()
+            timer.cancel()
+            future.result(timeout=10).drain()
+
+
+def test_drain_all_timeout_sync_while_a_service_is_starting():
+    # The creating thread holds the instance lock and may wait for `logging._lock`,
+    # which a `drain_all` caller can hold (`APILogHandler.flush` in
+    # `logging.shutdown`), so the timeout must also bound waiting for the lock
+    with starting_service_instance():
+        t0 = time.monotonic()
+        StartingService.drain_all(timeout=0.1)
+        t1 = time.monotonic()
+
+    assert t1 - t0 < 2
+
+
+async def test_drain_all_timeout_async_while_a_service_is_starting():
+    with starting_service_instance():
+        t0 = time.monotonic()
+        await StartingService.drain_all(timeout=0.1)
+        t1 = time.monotonic()
+
+    assert t1 - t0 < 2
+
+
 def test_lifespan():
     class LifespanService(QueueService[int]):
         events = []
